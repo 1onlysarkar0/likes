@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template, Response, stream_with_context
 import asyncio
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -7,34 +7,45 @@ import binascii
 import aiohttp
 import requests
 import json
-from proto import like_pb2  # If your folder is named "Proto"
+import os
+from proto import like_pb2
 from proto import like_count_pb2
 from proto import uid_generator_pb2
 from google.protobuf.message import DecodeError
+from token_manager import token_manager
 
 app = Flask(__name__)
 
+AES_KEY_STR = os.getenv('AES_ENCRYPTION_KEY')
+AES_IV_STR = os.getenv('AES_ENCRYPTION_IV')
+
+if not AES_KEY_STR or not AES_IV_STR:
+    app.logger.warning("⚠️  Using default encryption keys! Set AES_ENCRYPTION_KEY and AES_ENCRYPTION_IV as Replit Secrets for better security")
+    AES_KEY_STR = 'Yg&tc%DEuh6%Zc^8'
+    AES_IV_STR = '6oyZDr22E3ychjM%'
+
+AES_KEY = AES_KEY_STR.encode('utf-8')
+AES_IV = AES_IV_STR.encode('utf-8')
+
+token_manager.start_background_service()
+
 def load_tokens(server_name):
     try:
+        # Only IND server is supported
         if server_name == "IND":
             with open("token_ind.json", "r") as f:
                 tokens = json.load(f)
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            with open("token_br.json", "r") as f:
-                tokens = json.load(f)
+            return tokens
         else:
-            with open("token_bd.json", "r") as f:
-                tokens = json.load(f)
-        return tokens
+            app.logger.error(f"Only IND server is supported. Requested: {server_name}")
+            return None
     except Exception as e:
         app.logger.error(f"Error loading tokens for server {server_name}: {e}")
         return None
 
 def encrypt_message(plaintext):
     try:
-        key = b'Yg&tc%DEuh6%Zc^8'
-        iv = b'6oyZDr22E3ychjM%'
-        cipher = AES.new(key, AES.MODE_CBC, iv)
+        cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
         padded_message = pad(plaintext, AES.block_size)
         encrypted_message = cipher.encrypt(padded_message)
         return binascii.hexlify(encrypted_message).decode('utf-8')
@@ -167,6 +178,9 @@ def handle_requests():
     server_name = request.args.get("server_name", "").upper()
     if not uid or not server_name:
         return jsonify({"error": "UID and server_name are required"}), 400
+    
+    if server_name != "IND":
+        return jsonify({"error": "Only IND server is supported"}), 400
 
     try:
         def process_request():
@@ -232,10 +246,196 @@ def handle_requests():
         return jsonify({"error": str(e)}), 500
 @app.route("/", methods=["GET"])
 def home():
+    return render_template('dashboard.html')
+
+@app.route("/api", methods=["GET"])
+def api_info():
     return jsonify({
         "credits": "Dev By Flexbase",
-        "Telegram": "@Flexbaseu"
+        "Telegram": "@Flexbaseu",
+        "supported_server": "IND only",
+        "endpoints": {
+            "/like": "Process like requests (IND server only)",
+            "/token-status": "Check token health and status",
+            "/stats": "View token generation statistics",
+            "/refresh-tokens": "Manually trigger token refresh (IND only)"
+        }
     })
-if __name__ == '__main__':
+
+@app.route("/token-status", methods=["GET"])
+def token_status():
+    """Get current token system status"""
+    try:
+        status = token_manager.get_status()
+        return jsonify(status), 200
+    except Exception as e:
+        app.logger.error(f"Error getting token status: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/stats", methods=["GET"])
+def get_stats():
+    """Get token generation statistics"""
+    try:
+        stats = {
+            "service_running": token_manager.is_running,
+            "total_tokens_generated": token_manager.stats["total_generated"],
+            "total_failures": token_manager.stats["total_failed"],
+            "last_refresh": token_manager.stats["last_refresh"],
+            "per_region_stats": token_manager.stats["per_region"],
+            "refresh_interval_seconds": token_manager.refresh_check_interval,
+            "concurrent_limit": token_manager.concurrent_limit
+        }
+        return jsonify(stats), 200
+    except Exception as e:
+        app.logger.error(f"Error getting stats: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/refresh-tokens", methods=["POST"])
+def refresh_tokens():
+    """Manually trigger token refresh for IND region only"""
+    try:
+        region = request.args.get("region", "IND").upper()
+        
+        if region != "IND":
+            return jsonify({"error": "Only IND region is supported"}), 400
+        
+        app.logger.info(f"Manual token refresh triggered for region: IND")
+        
+        token_manager.refresh_tokens_sync("IND")
+        
+        return jsonify({
+            "message": "Token refresh completed for IND region",
+            "stats": token_manager.get_status()
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error refreshing tokens: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/generate-all-tokens-stream")
+def generate_all_tokens_stream():
+    """Stream token generation progress with Server-Sent Events"""
+    region = request.args.get("region", "IND").upper()
     
-    app.run(debug=True, use_reloader=False)
+    if region != "IND":
+        return jsonify({"error": "Only IND region is supported"}), 400
+    
+    def generate():
+        import asyncio
+        import queue
+        
+        progress_queue = queue.Queue()
+        
+        async def progress_callback(uid, success, total, current, success_count, failed_count):
+            progress_queue.put({
+                'uid': uid,
+                'success': success,
+                'total': total,
+                'current': current,
+                'success_count': success_count,
+                'failed_count': failed_count
+            })
+        
+        async def run_generation():
+            try:
+                success_count, failed_count = await token_manager.generate_all_tokens(region, progress_callback)
+                progress_queue.put({
+                    'done': True,
+                    'success': success_count,
+                    'failed': failed_count,
+                    'total': success_count + failed_count
+                })
+            except Exception as e:
+                progress_queue.put({
+                    'error': str(e)
+                })
+        
+        import threading
+        def run_async():
+            asyncio.run(run_generation())
+        
+        thread = threading.Thread(target=run_async)
+        thread.start()
+        
+        while True:
+            try:
+                data = progress_queue.get(timeout=1)
+                yield f"data: {json.dumps(data)}\n\n"
+                
+                if data.get('done') or data.get('error'):
+                    break
+            except:
+                yield f"data: {json.dumps({'ping': True})}\n\n"
+        
+        thread.join()
+    
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+@app.route("/refresh-tokens-stream")
+def refresh_tokens_stream():
+    """Stream token refresh progress with Server-Sent Events"""
+    region = request.args.get("region", "IND").upper()
+    
+    if region != "IND":
+        return jsonify({"error": "Only IND region is supported"}), 400
+    
+    def generate():
+        import queue
+        
+        progress_queue = queue.Queue()
+        
+        async def progress_callback(uid, success, total, current, success_count, failed_count):
+            progress_queue.put({
+                'uid': uid,
+                'success': success,
+                'total': total,
+                'current': current,
+                'success_count': success_count,
+                'failed_count': failed_count
+            })
+        
+        async def run_refresh():
+            try:
+                if token_manager.needs_refresh(region):
+                    success_count, failed_count = await token_manager.generate_all_tokens(region, progress_callback)
+                    progress_queue.put({
+                        'done': True,
+                        'success': success_count,
+                        'failed': failed_count,
+                        'total': success_count + failed_count
+                    })
+                else:
+                    progress_queue.put({
+                        'done': True,
+                        'message': 'Tokens are still valid, no refresh needed'
+                    })
+            except Exception as e:
+                progress_queue.put({
+                    'error': str(e)
+                })
+        
+        import threading
+        def run_async():
+            asyncio.run(run_refresh())
+        
+        thread = threading.Thread(target=run_async)
+        thread.start()
+        
+        while True:
+            try:
+                data = progress_queue.get(timeout=1)
+                yield f"data: {json.dumps(data)}\n\n"
+                
+                if data.get('done') or data.get('error'):
+                    break
+            except:
+                yield f"data: {json.dumps({'ping': True})}\n\n"
+        
+        thread.join()
+    
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+if __name__ == '__main__':
+    import os
+    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    app.run(host='0.0.0.0', port=5000, debug=debug_mode)
