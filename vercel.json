@@ -1,18 +1,8 @@
 {
-  "version": 2,
-  "builds": [
+  "rewrites": [
     {
-      "src": "pb2/index.py",
-      "use": "@vercel/python"
+      "source": "/(.*)",
+      "destination": "/pb2/index"
     }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "pb2/index.py"
-    }
-  ],
-  "env": {
-    "FLASK_ENV": "production"
-  }
+  ]
 }
